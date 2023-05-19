@@ -104,3 +104,7 @@ lto = "fat"
 inherits = "release"
 lto = false
 opt-level = 0
+
+[patch.crates-io]
+# Temporary patch until <https://github.com/hyperium/tonic/pull/1401> is implemented
+tonic = { git = 'https://github.com/timvisee/tonic', branch = "http2-max-pending-reset-streams" }
