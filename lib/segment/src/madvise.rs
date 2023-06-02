@@ -75,13 +75,8 @@ impl TryFrom<Advice> for memmap2::Advice {
             Advice::Random => Ok(memmap2::Advice::Random),
             Advice::Sequential => Ok(memmap2::Advice::Sequential),
 
-            // TODO: Wait till support for `MADV_POPULATE_READ` in `memmap2` crate is released
-            // https://github.com/RazrFalcon/memmap2-rs/pull/84
             #[cfg(target_os = "linux")]
-            Advice::PopulateRead => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "MADV_POPULATE_READ is not supported by memmap2 crate yet",
-            )),
+            Advice::PopulateRead => Ok(memmap2::Advice::PopulateRead),
 
             #[cfg(not(target_os = "linux"))]
             Advice::PopulateRead => Err(io::Error::new(
