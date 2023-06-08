@@ -1,8 +1,6 @@
 use std::os::fd::AsRawFd as _;
 use std::{fs, io};
 
-use io_uring::{opcode, types, CompletionQueue, SubmissionQueue, Submitter};
-
 use crate::common::mmap_ops::transmute_from_u8_to_slice;
 use crate::data_types::vectors::VectorElementType;
 use crate::entry::entry_point::OperationResult;
@@ -11,9 +9,9 @@ use crate::types::PointOffsetType;
 const DISK_PARALLELISM: usize = 16; // TODO: benchmark it better, or make it configurable
 
 pub struct UringReader {
-    file: fs::File,
     io_uring: io_uring::IoUring,
     buffers: Vec<Buffer>,
+    file: fs::File,
     header_size_bytes: usize,
     vector_size_bytes: usize,
 }
@@ -36,12 +34,12 @@ impl Buffer {
 #[derive(Copy, Clone, Debug)]
 struct Point {
     index: usize,
-    point: PointOffsetType,
+    offset: PointOffsetType,
 }
 
 impl Point {
-    pub fn new(index: usize, point: PointOffsetType) -> Self {
-        Self { index, point }
+    pub fn new(index: usize, offset: PointOffsetType) -> Self {
+        Self { index, offset }
     }
 }
 
@@ -51,13 +49,10 @@ impl UringReader {
         header_size_bytes: usize,
         vector_size_bytes: usize,
     ) -> OperationResult<Self> {
-        let io_uring = io_uring::IoUring::new(DISK_PARALLELISM as _)?;
-        let buffers = Vec::new();
-
         let reader = Self {
+            io_uring: io_uring::IoUring::new(DISK_PARALLELISM as _)?,
+            buffers: Vec::new(),
             file,
-            io_uring,
-            buffers,
             header_size_bytes,
             vector_size_bytes,
         };
@@ -71,120 +66,72 @@ impl UringReader {
         points: impl IntoIterator<Item = PointOffsetType>,
         mut callback: impl FnMut(usize, PointOffsetType, &[VectorElementType]),
     ) -> OperationResult<()> {
-        let (submitter, mut sq, mut cq) = self.io_uring.split();
-        let mut points = points.into_iter().enumerate();
+        let mut uring = IoUringView::from_io_uring(&mut self.io_uring);
+
+        let mut points = points
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| Point::new(index, offset));
 
         let mut submitted = 0;
 
-        // Push and submit up to either `DISK_PARALLELISM` or CQ capacity (whichever is smaller) SQEs.
-        //
-        // - CQ capacty is *twice* the SQ capacity
-        // - and each iteration may submit up to SQ capacity SQEs
-        // - so this loop should spin at most *two* iterations
-        while submitted < DISK_PARALLELISM.min(cq.capacity()) {
-            // Push SQEs into SQ up to SQ capacity.
-            while !sq.is_full() {
-                // Check if there are more SQEs...
-                let Some((point_index, point)) = points.next() else {
-                    // No more SQEs to push.
+        while submitted < DISK_PARALLELISM.min(uring.cq.capacity()) {
+            while !uring.sq.is_full() {
+                let Some(point) = points.next() else {
                     break;
                 };
 
-                self.buffers.push(Buffer::new(self.vector_size_bytes));
-
-                let buffer_index = self.buffers.len() - 1;
-                let buffer = &mut self.buffers[buffer_index];
-
-                // TODO: Deduplicate with similar snippet in CQ loop?
-                let point_offset_bytes =
-                    self.header_size_bytes + self.vector_size_bytes * point as usize;
-
-                let sqe = opcode::Read::new(
-                    types::Fd(self.file.as_raw_fd()),
-                    buffer.buffer.as_mut_ptr(),
-                    buffer.buffer.len() as _,
-                )
-                .offset(point_offset_bytes as _)
-                .build()
-                .user_data(buffer_index as _);
-
-                buffer.point = Some(Point::new(point_index, point));
-
-                unsafe { sq.push(&sqe).expect("SQ is not full") };
+                push_sqe(
+                    &mut uring.sq,
+                    &mut self.buffers,
+                    &self.file,
+                    self.header_size_bytes,
+                    self.vector_size_bytes,
+                    point,
+                    None,
+                );
             }
 
-            if sq.is_empty() {
-                // SQ is empty, no SQEs to submit.
+            if uring.sq.is_empty() {
                 break;
             }
 
-            // Track submitted SQEs.
-            submitted += submit_sqes(&submitter, &mut sq)?;
+            submitted += uring.submit_sq()?;
         }
 
-        // Wait for at least one CQE.
-        probe_or_wait_for_cqe(&submitter, &mut cq)?;
+        uring.probe_cq_or_wait_cq()?;
 
-        // TODO
         while submitted > 0 {
-            // TODO
-            for cqe in &mut cq {
-                // Track consumed CQE.
+            for cqe in &mut uring.cq {
                 submitted -= 1;
 
-                // Process consumed CQE.
-                let buffer_index = cqe.user_data() as usize;
-                let buffer = &mut self.buffers[buffer_index];
+                let (buffer_index, point, vector) = consume_cqe(&mut self.buffers, cqe)?;
 
-                let point = buffer
-                    .point
-                    .take()
-                    .expect("point data is associated with the buffer");
-                let vector = transmute_from_u8_to_slice(&buffer.buffer);
+                callback(point.index, point.offset, vector);
 
-                callback(point.index, point.point, &vector);
-
-                // Check if there are more SQEs to push and submit.
-                let Some((point_index, point)) = points.next() else {
-                    if sq.is_empty() {
-                        // All points exhausted and SQ is empty.
-                        // Continue processing CQEs in the inner loop until CQ is empty.
-                        continue;
-                    } else {
-                        // All points exhausted and SQ is not empty.
-                        // Break out of the inner loop to submit *the last* SQEs.
-                        break;
-                    }
+                let Some(point) = points.next() else {
+                    continue;
                 };
 
-                // TODO: Deduplicate with similar snippet in SQ loop?
-                let point_offset_bytes =
-                    self.header_size_bytes + self.vector_size_bytes * point as usize;
+                push_sqe(
+                    &mut uring.sq,
+                    &mut self.buffers,
+                    &self.file,
+                    self.header_size_bytes,
+                    self.vector_size_bytes,
+                    point,
+                    Some(buffer_index),
+                );
 
-                let sqe = io_uring::opcode::Read::new(
-                    types::Fd(self.file.as_raw_fd()),
-                    buffer.buffer.as_mut_ptr(),
-                    buffer.buffer.len() as _,
-                )
-                .offset(point_offset_bytes as _)
-                .build()
-                .user_data(buffer_index as _);
-
-                buffer.point = Some(Point::new(point_index, point));
-
-                unsafe { sq.push(&sqe).expect("SQ is not full") };
-
-                if sq.is_full() {
-                    // SQ is full.
-                    // Break out of the inner loop to submit *more* SQEs.
+                if uring.sq.is_full() {
                     break;
                 }
             }
 
-            if sq.is_empty() {
-                probe_or_wait_for_cqe(&submitter, &mut cq)?;
+            if !uring.sq.is_full() {
+                submitted += uring.probe_cq_or_wait_cq_and_maybe_submit_sq()?;
             } else {
-                submitted += submit_sqes_and_wait_for_cqe(&submitter, &mut sq, &mut cq)?;
+                submitted += uring.submit_sq_and_maybe_wait_cq()?;
             }
         }
 
@@ -192,119 +139,153 @@ impl UringReader {
     }
 }
 
-fn check_cq_is_empty(cq: &mut io_uring::CompletionQueue<'_>) -> bool {
-    cq.sync();
-    cq.is_empty()
+struct IoUringView<'a> {
+    submitter: io_uring::Submitter<'a>,
+    sq: io_uring::SubmissionQueue<'a>,
+    cq: io_uring::CompletionQueue<'a>,
 }
 
-fn probe_cq_is_empty(cq: &mut io_uring::CompletionQueue<'_>) -> bool {
-    for _ in 0..3 {
-        if !check_cq_is_empty(cq) {
-            return false;
+impl<'a> IoUringView<'a> {
+    pub fn from_io_uring(io_uring: &'a mut io_uring::IoUring) -> Self {
+        let (submitter, sq, cq) = io_uring.split();
+        Self { submitter, sq, cq }
+    }
+
+    pub fn submit_sq(&mut self) -> io::Result<usize> {
+        self.submit_sq_and_wait_cq(0)
+    }
+
+    pub fn probe_cq_or_wait_cq(&mut self) -> io::Result<()> {
+        let submitted = self.probe_cq_or_wait_cq_and_maybe_submit_sq()?;
+
+        debug_assert_eq!(
+            submitted, 0,
+            "TODO", // TODO
+        );
+
+        Ok(())
+    }
+
+    pub fn probe_cq_or_wait_cq_and_maybe_submit_sq(&mut self) -> io::Result<usize> {
+        if self.probe_cq_is_empty() {
+            self.submit_sq_and_wait_cq(1)
+        } else {
+            Ok(0)
         }
     }
 
-    true
-}
-
-fn probe_or_wait_for_cqe(
-    submitter: &io_uring::Submitter<'_>,
-    mut cq: &mut io_uring::CompletionQueue,
-) -> io::Result<()> {
-    if probe_cq_is_empty(&mut cq) {
-        wait_for_cqe(submitter, cq)?;
+    pub fn submit_sq_and_maybe_wait_cq(&mut self) -> io::Result<usize> {
+        let want = if self.probe_cq_is_empty() { 1 } else { 0 };
+        self.submit_sq_and_wait_cq(want)
     }
 
-    Ok(())
-}
+    fn check_cq_is_empty(&mut self) -> bool {
+        self.cq.sync();
+        self.cq.is_empty()
+    }
 
-fn wait_for_cqe(
-    submitter: &io_uring::Submitter<'_>,
-    cq: &mut io_uring::CompletionQueue<'_>,
-) -> io::Result<()> {
-    // Submit pushed SQEs (if any) and wait for CQE.
-    let submitted = submit_and_wait(submitter, cq)?;
+    fn probe_cq_is_empty(&mut self) -> bool {
+        for _ in 0..3 {
+            if !self.check_cq_is_empty() {
+                return false;
+            }
+        }
 
-    // Assert that no SQEs have been *unexpectedly* submitted while waiting for CQE.
-    debug_assert_eq!(
-        submitted, 0,
-        "Some SQEs have been *unexpectedly* submitted while waiting for CQEs!",
-    );
+        true
+    }
 
-    Ok(())
-}
+    fn submit_sq_and_wait_cq(&mut self, want: usize) -> io::Result<usize> {
+        // Sync SQ (so that kernel will see pushed SQEs)
+        self.sq.sync();
 
-fn submit_sqes(
-    submitter: &io_uring::Submitter<'_>,
-    sq: &mut io_uring::SubmissionQueue<'_>,
-) -> io::Result<usize> {
-    // Sync SQ (so that kernel will see pushed SQEs).
-    sq.sync();
+        // Submit SQEs (if any) and wait for `want` CQEs
+        let submitted = self.submitter.submit_and_wait(want)?;
 
-    // Submit pushed SQEs.
-    let submitted = submitter.submit()?;
-
-    assert_submitted_sqes(sq, submitted);
-    Ok(submitted)
-}
-
-fn submit_sqes_and_wait_for_cqe(
-    submitter: &io_uring::Submitter<'_>,
-    sq: &mut io_uring::SubmissionQueue<'_>,
-    mut cq: &mut io_uring::CompletionQueue<'_>,
-) -> io::Result<usize> {
-    // Sync SQ (so that kernel will see pushed SQEs).
-    sq.sync();
-
-    // Check if CQ is empty.
-    let submitted = if check_cq_is_empty(&mut cq) {
-        // If CQ is empty, then submit pushed SQEs and wait for CQEs.
+        // Assert that all (and no more than expected) SQEs have been submitted.
         //
-        // We *have to* submit at this point, and "waiting" is the same syscall,
-        // so we get a "free" wait here.
-        submit_and_wait(&submitter, cq)?
-    } else {
-        // If CQ is not empty, then submit pushed SQEs without waiting.
-        submitter.submit()?
+        // Kernel should consume SQEs from SQ during submit, but `self.sq` state is not updated
+        // until `sync` call, so `self.sq` should still hold pre-`submit` state at this point.
+        debug_assert_eq!(
+            submitted,
+            self.sq.len(),
+            "Not all (or more than expected) SQEs have been submitted!",
+        );
+
+        if submitted > 0 {
+            // Sync SQ (so that we will see SQEs consumed by the kernel)
+            self.sq.sync();
+
+            // Assert that all SQEs have been consumed during submit (SQ is empty)
+            debug_assert!(
+                self.sq.is_empty(),
+                "Not all SQEs have been consumed during submit (SQ is not empty)!",
+            );
+        }
+
+        if want > 0 {
+            // Sync CQ (so that we will see CQEs pushed by the kernel).
+            self.cq.sync();
+
+            // Assert that CQ is not empty after `submit_and_wait`.
+            debug_assert!(!self.cq.is_empty(), "CQ is empty after `submit_and_wait`!");
+        }
+
+        Ok(submitted)
+    }
+}
+
+fn push_sqe(
+    sq: &mut io_uring::SubmissionQueue,
+    buffers: &mut Vec<Buffer>,
+    file: &fs::File,
+    header_size_bytes: usize,
+    vector_size_bytes: usize,
+    point: Point,
+    buffer_index: Option<usize>,
+) {
+    let (buffer_index, buffer) = match buffer_index {
+        None => new_buffer(buffers, vector_size_bytes),
+        Some(buffer_index) => (buffer_index, &mut buffers[buffer_index]),
     };
 
-    assert_submitted_sqes(sq, submitted);
-    Ok(submitted)
+    let vector_offset_bytes = header_size_bytes + vector_size_bytes * point.offset as usize;
+
+    let sqe = io_uring::opcode::Read::new(
+        io_uring::types::Fd(file.as_raw_fd()),
+        buffer.buffer.as_mut_ptr(),
+        buffer.buffer.len() as _,
+    )
+    .offset(vector_offset_bytes as _)
+    .build()
+    .user_data(buffer_index as _);
+
+    buffer.point = Some(point);
+
+    unsafe {
+        sq.push(&sqe).expect("SQ is not full");
+    }
 }
 
-fn submit_and_wait(
-    submitter: &io_uring::Submitter<'_>,
-    cq: &mut io_uring::CompletionQueue<'_>,
-) -> io::Result<usize> {
-    // Submit pushed SQEs (if any) and wait for CQE.
-    let submitted = submitter.submit_and_wait(1)?;
+fn new_buffer(buffers: &mut Vec<Buffer>, vector_size_bytes: usize) -> (usize, &mut Buffer) {
+    buffers.push(Buffer::new(vector_size_bytes));
 
-    // Sync CQ (so that we will see CQEs pushed by the kernel).
-    cq.sync();
+    let buffer_index = buffers.len() - 1;
+    let buffer = &mut buffers[buffer_index];
 
-    // Assert that CQ is not empty after `submit_and_wait`.
-    debug_assert!(!cq.is_empty(), "CQ is empty after `submit_and_wait`!");
-
-    Ok(submitted)
+    (buffer_index, buffer)
 }
 
-fn assert_submitted_sqes(sq: &mut io_uring::SubmissionQueue<'_>, submitted: usize) {
-    // Assert that all (and no more than expected) SQEs have been submitted.
-    //
-    // Kernel should consume SQEs from SQ during submit, but `sq` state is not updated
-    // until `sync` call, so `sq` should still hold pre-`submit` state at this point.
-    debug_assert_eq!(
-        submitted,
-        sq.len(),
-        "Not all (or more than expected) SQEs have been submitted!",
-    );
+fn consume_cqe(
+    buffers: &mut [Buffer],
+    cqe: io_uring::cqueue::Entry,
+) -> io::Result<(usize, Point, &[f32])> {
+    // TODO: Check `cqe.result`!
 
-    // Sync SQ (so that we will see SQEs consumed by the kernel).
-    sq.sync();
+    let buffer_index = cqe.user_data() as usize;
 
-    // Assert that all SQEs have been consumed during submit and SQ is empty.
-    debug_assert!(
-        sq.is_empty(),
-        "Not all SQEs have been consumed during submit! SQ is not empty!",
-    );
+    let buffer = &mut buffers[buffer_index];
+    let point = buffer.point.take().expect("");
+    let vector = transmute_from_u8_to_slice(&buffer.buffer);
+
+    Ok((buffer_index, point, vector))
 }
