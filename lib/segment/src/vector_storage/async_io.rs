@@ -103,7 +103,7 @@ impl UringReader {
 
         while submitted > 0 {
             for cqe in (&mut uring.cq).filter(|cqe| cqe.user_data() != u64::MAX) {
-                 submitted -= 1;
+                submitted -= 1;
 
                 let (buffer_index, point, vector) = consume_cqe(&mut self.buffers, cqe)?;
 
