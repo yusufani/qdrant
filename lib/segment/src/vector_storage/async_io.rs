@@ -102,8 +102,8 @@ impl UringReader {
         uring.probe_cq_or_wait_cq()?;
 
         while submitted > 0 {
-            for cqe in &mut uring.cq {
-                submitted -= 1;
+            for cqe in (&mut uring.cq).filter(|cqe| cqe.user_data() != u64::MAX) {
+                 submitted -= 1;
 
                 let (buffer_index, point, vector) = consume_cqe(&mut self.buffers, cqe)?;
 
@@ -198,8 +198,16 @@ impl<'a> IoUringView<'a> {
         // Sync SQ (so that kernel will see pushed SQEs)
         self.sq.sync();
 
+        let submit_nop = want > 0 && self.sq.is_empty();
+
+        if submit_nop {
+            let sqe = io_uring::opcode::Nop::new().build().user_data(u64::MAX);
+            unsafe { self.sq.push(&sqe).expect("SQ is not full") };
+            self.sq.sync();
+        }
+
         // Submit SQEs (if any) and wait for `want` CQEs
-        let submitted = self.submitter.submit_and_wait(want)?;
+        let mut submitted = self.submitter.submit_and_wait(want)?;
 
         // Assert that all (and no more than expected) SQEs have been submitted.
         //
@@ -228,6 +236,10 @@ impl<'a> IoUringView<'a> {
 
             // Assert that CQ is not empty after `submit_and_wait`.
             debug_assert!(!self.cq.is_empty(), "CQ is empty after `submit_and_wait`!");
+        }
+
+        if submit_nop {
+            submitted = submitted.saturating_sub(1);
         }
 
         Ok(submitted)
