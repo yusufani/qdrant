@@ -206,7 +206,7 @@ impl MmapVectors {
     pub fn process_points(
         &self,
         points: impl Iterator<Item = PointOffsetType>,
-        callback: impl FnMut(usize, PointOffsetType, &[VectorElementType]),
+        mut callback: impl FnMut(usize, PointOffsetType, &[VectorElementType]),
     ) -> OperationResult<()> {
         #[cfg(target_os = "linux")]
         {
